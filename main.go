@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 func chunkText(text string, chunkSize int) []string {
@@ -38,12 +39,21 @@ type TRequest struct {
 	TLanguage string `json:"target_language"`
 }
 
-type ARequest struct{
+type ARequest struct {
 	BookID    string `json:"book_id"`
 	TLanguage string `json:"target_language"`
-	VoiceID string `json:"voice_id"`
-
+	VoiceID   string `json:"voice_id"`
 }
+
+type Job struct {
+	Status   string `json:"status"`
+	Error    string `json:"error"`
+	FilePath string `json:"file_path"`
+	Progress string `json:"progress"`
+}
+
+var jobs = make(map[string]*Job)
+var mu sync.Mutex
 
 func translate(ctx context.Context, text string, targetLang string) (string, error) {
 	url := "https://api.sarvam.ai/translate"
@@ -88,10 +98,10 @@ func translate(ctx context.Context, text string, targetLang string) (string, err
 func audiotranslate(ctx context.Context, text string, voiceid string) ([]byte, error) {
 	url := fmt.Sprintf("https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=mp3_44100_128", voiceid)
 	body := map[string]string{
-    	"text":     text,
-    	"model_id": "eleven_v3",
-    	"language_code": "te",
-}
+		"text":          text,
+		"model_id":      "eleven_v3",
+		"language_code": "te",
+	}
 	jsonAudio, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -137,7 +147,7 @@ func FindHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(chunks)
 
 }
-func AudioHandler(w http.ResponseWriter,r *http.Request){
+func AudioHandler(w http.ResponseWriter, r *http.Request) {
 	var audiorequest ARequest
 	err := json.NewDecoder(r.Body).Decode(&audiorequest)
 	if err != nil {
@@ -160,11 +170,11 @@ func AudioHandler(w http.ResponseWriter,r *http.Request){
 			http.Error(w, fmt.Sprintf("error reading file: %v", err), http.StatusInternalServerError)
 			return
 		}
-		audiotranslated = append(audiotranslated,caudio...)
+		audiotranslated = append(audiotranslated, caudio...)
 	}
 	audioDir := filepath.Join(".", "data", "audios")
 	audioFile := audiorequest.BookID + "_" + audiorequest.TLanguage + ".mp3"
-	
+
 	if err := os.MkdirAll(audioDir, 0755); err != nil {
 		http.Error(w, "Could not read", http.StatusBadRequest)
 		return
@@ -194,7 +204,7 @@ func TranslateHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "error in reading the file", http.StatusInternalServerError)
 		return
 	}
-	chunks := chunkText(string(data), 2000)
+	chunks := chunkText(string(data), 900)
 	var translated []string
 	for _, c := range chunks {
 		ttext, err := translate(r.Context(), c, request.TLanguage)
@@ -259,6 +269,101 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func GenerateHandler(w http.ResponseWriter, r *http.Request) {
+	var usereq ARequest
+	err := json.NewDecoder(r.Body).Decode(&usereq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Bad JSON Request %v", err), http.StatusInternalServerError)
+		return
+	}
+	jobID := uuid.New().String()
+	mu.Lock()
+	jobs[jobID] = &Job{Status: "starting"}
+	mu.Unlock()
+	bgCtx := context.WithoutCancel(r.Context())
+	go func() {
+		dirName := "./data/translations/"
+		fileName := usereq.BookID + "_" + usereq.TLanguage + ".txt"
+		filePath := filepath.Join(dirName, fileName)
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			mu.Lock()
+			jobs[jobID].Status = "failed"
+			jobs[jobID].Error = err.Error()
+			mu.Unlock()
+			return
+		}
+		chunks := chunkText(string(data), 2000)
+		var audioBytes []byte
+		for i, c := range chunks {
+			mu.Lock()
+			jobs[jobID].Status = "generating audio"
+			jobs[jobID].Progress = fmt.Sprintf("chunk %d of %d", i+1, len(chunks))
+			mu.Unlock()
+			caudio, err := audiotranslate(bgCtx, c, usereq.VoiceID)
+			if err != nil {
+				mu.Lock()
+				jobs[jobID].Error = err.Error()
+				mu.Unlock()
+				continue
+			}
+			audioBytes = append(audioBytes, caudio...)
+		}
+		audioDir := filepath.Join(".", "data", "audios")
+		os.MkdirAll(audioDir, 0755)
+		audioFile := usereq.BookID + "_" + usereq.TLanguage + ".mp3"
+		audioPath := filepath.Join(audioDir, audioFile)
+		err = os.WriteFile(audioPath, audioBytes, 0644)
+		if err != nil {
+			mu.Lock()
+			jobs[jobID].Status = "failed"
+			jobs[jobID].Error = err.Error()
+			mu.Unlock()
+			return
+		}
+
+		mu.Lock()
+		jobs[jobID].Status = "done"
+		jobs[jobID].FilePath = audioPath
+		mu.Unlock()
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"job_id": jobID, "status": "starting"})
+
+}
+
+func StatusHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	mu.Lock()
+	userjob, ok := jobs[id]
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if userjob, ok = jobs[id]; ok {
+		json.NewEncoder(w).Encode(userjob)
+	} else {
+		http.Error(w, "Could not find", http.StatusNotFound)
+		return
+	}
+}
+func DownloadHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	mu.Lock()
+	userjob, ok := jobs[id]
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if !ok {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+	if userjob.Status != "done" {
+		http.Error(w, "audio still processing", http.StatusBadRequest)
+		return
+	}
+	http.ServeFile(w, r, userjob.FilePath)
+
+}
+
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -269,10 +374,12 @@ func main() {
 	router.HandleFunc("POST /upload", UploadHandler)
 	router.HandleFunc("POST /translate", TranslateHandler)
 	router.HandleFunc("GET /book/{id}/chunks", FindHandler)
-	router.HandleFunc("POST /audiotranslate",AudioHandler)
+	router.HandleFunc("POST /audiotranslate", AudioHandler)
+	router.HandleFunc("POST /generate", GenerateHandler)
+	router.HandleFunc("GET /status/{id}", StatusHandler)
+	router.HandleFunc("GET /download/{id}", DownloadHandler)
 	fmt.Println("starting server on the port 8080")
 	fmt.Println("SARVAM KEY loaded:", os.Getenv("SARVAM_API_KEY") != "")
 	fmt.Println("ELEVEN_LABS key loaded:", os.Getenv("ELEVEN_LABS") != "")
 	http.ListenAndServe(":8080", router)
 }
-
