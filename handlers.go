@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/ledongthuc/pdf"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -141,7 +142,7 @@ func TranslateHandler(w http.ResponseWriter, r *http.Request) {
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "Bad File", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("failed to read uploaded file: %v", err), http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
@@ -150,9 +151,48 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "Could not read Bad File", http.StatusBadRequest)
+	ext := filepath.Ext(header.Filename)
+	var textContent []byte
+	if ext == ".pdf" {
+		tmpFile, err := os.CreateTemp("", "upload-*.pdf")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to create temp file: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		_, err = io.Copy(tmpFile, file)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to save temp file: %v", err), http.StatusInternalServerError)
+			return
+		}
+		tmpFile.Close()
+
+		f, reader, err := pdf.Open(tmpFile.Name())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to open PDF: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+
+		plainText, err := reader.GetPlainText()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to extract text: %v", err), http.StatusInternalServerError)
+			return
+		}
+		var buf bytes.Buffer
+		buf.ReadFrom(plainText)
+		textContent = buf.Bytes()
+
+	} else if ext == ".txt" {
+		textContent, err = io.ReadAll(file)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to read file: %v", err), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		http.Error(w, "only .txt and .pdf files are supported", http.StatusBadRequest)
 		return
 	}
 
@@ -160,19 +200,17 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := newuuid + ".txt"
 	dirPath := filepath.Join(".", "data/books")
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		http.Error(w, "i have error", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("failed to create directory: %v", err), http.StatusInternalServerError)
 		return
-
 	}
 	filePath := filepath.Join(dirPath, fileName)
-	err = os.WriteFile(filePath, content, 0644)
+	err = os.WriteFile(filePath, textContent, 0644)
 	if err != nil {
-		http.Error(w, "Could not read", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("failed to save file: %v", err), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"book_id": newuuid, "char_count": len(content)})
-
+	json.NewEncoder(w).Encode(map[string]any{"book_id": newuuid, "char_count": len(textContent)})
 }
 
 func GenerateHandler(w http.ResponseWriter, r *http.Request) {
